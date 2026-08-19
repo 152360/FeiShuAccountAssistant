@@ -6,7 +6,7 @@ import time
 import random
 import functools
 from typing import Callable, TypeVar, Any
-from logger_config import get_logger
+from config.logger_config import get_logger
 
 logger = get_logger(__name__)
 

@@ -1,12 +1,12 @@
 """
 飞书记账机器人 - 完整版（云服务器就绪）
-功能：接收用户消息，AI 解析金额和描述，写入飞书多维表格，并回复结果
+功能：接收用户消息，由 AI agent 自主调用工具完成记账/查账，并回复结果
 使用长连接接收事件，无需公网地址
 
 消息处理流程：
   1. 收到消息 → 立即回复"正在处理"（避免飞书长连接 3s 超时）
-  2. 异步提交到线程池 → AI 解析 + 写入表格 + 回复最终结果
-  3. AI 解析失败时自动降级到正则匹配
+  2. 异步提交到线程池 → agent 调用工具记账/查账 → 回复最终结果（自由文本）
+  3. AI 处理失败时自动降级到正则记账
 """
 
 import json
@@ -18,10 +18,9 @@ import lark_oapi as lark
 from lark_oapi.api.im.v1 import *
 from concurrent.futures import ThreadPoolExecutor
 
-from glob_config import APP_ID, APP_SECRET, ASYNC_MAX_WORKERS
-from handler import add_account_record
-from agent import get_agent, parse_with_ai
-from logger_config import get_logger, setup_logging
+from config.glob_config import APP_ID, APP_SECRET, ASYNC_MAX_WORKERS
+from core import get_agent, run_agent, get_feishu_client
+from config.logger_config import get_logger
 from utils import retry_with_backoff
 
 logger = get_logger(__name__)
@@ -30,7 +29,7 @@ logger = get_logger(__name__)
 _executor = ThreadPoolExecutor(max_workers=ASYNC_MAX_WORKERS)
 
 # ── 全局状态 ──────────────────────────────────────────────
-client: lark.Client | None = None
+_client: lark.Client
 processed_message_ids: set[str] = set()
 _shutdown_requested = False
 
@@ -57,7 +56,7 @@ def send_reply(message_id: str, reply_text: str) -> None:
         )
         .build()
     )
-    response = client.im.v1.message.reply(request)
+    response = _client.im.v1.message.reply(request)
     if not response.success():
         error_detail = f"code={response.code}, msg={response.msg}"
         logger.error("回复消息失败: %s", error_detail)
@@ -68,49 +67,25 @@ def send_reply(message_id: str, reply_text: str) -> None:
 # ── 异步消息处理 ──────────────────────────────────────────
 def async_process_message(message_id: str, msg_text: str) -> None:
     """
-    异步处理消息：AI 解析 → 写入表格 → 回复结果
+    异步处理消息：agent 自主调用工具记账/查账 → 回复自由文本结果
     此函数在线程池中执行，不会阻塞飞书长连接
     """
     thread_name = f"[msg={message_id[-8:]}]"
     logger.info("%s 开始异步处理: %s", thread_name, msg_text)
 
     try:
-        # ── 1. AI 解析（失败时自动降级到正则匹配）──
+        # agent 自主调用工具完成记账/查账（AI 失败时自动降级到正则记账）
         agent = get_agent()
-        result = parse_with_ai(agent, msg_text)
+        result = run_agent(agent, msg_text)
 
         if not result.get("success"):
-            send_reply(message_id, f"❌ {result.get('error_msg')}")
-            logger.warning("%s 消息解析失败: %s", thread_name, result.get("error_msg"))
+            reply = result.get("reply") or f"❌ {result.get('error_msg')}"
+            send_reply(message_id, reply)
+            logger.warning("%s 消息处理失败: %s", thread_name, result.get("error_msg"))
             return
 
-        amount = result["amount"]
-        category = result["category"]
-        account = result["account"]
-        note = result["note"]
-
-        logger.info(
-            "%s AI 解析完成: amount=%s, category=%s, account=%s, note=%s",
-            thread_name, amount, category, account, note,
-        )
-
-        # ── 2. 写入多维表格 ──
-        success, result_msg = add_account_record(
-            client, amount, note, category, account
-        )
-
-        # ── 3. 回复最终结果 ──
-        if success:
-            reply = (
-                f"✅ {result_msg}\n"
-                f"💰 {amount}元 | {category} | {account}\n"
-                f"📝 {note}"
-            )
-            logger.info("%s 记账成功", thread_name)
-        else:
-            reply = f"❌ {result_msg}"
-            logger.error("%s 写入表格失败: %s", thread_name, result_msg)
-
+        reply = result["reply"]
+        logger.info("%s 处理完成: %s", thread_name, reply)
         send_reply(message_id, reply)
 
     except Exception:
@@ -185,7 +160,7 @@ def _shutdown(signum=None, frame=None) -> None:
 
 # ── 主入口 ────────────────────────────────────────────────
 def main() -> None:
-    global client
+    global _client
 
     # 注册信号处理
     signal.signal(signal.SIGTERM, _shutdown)
@@ -198,16 +173,7 @@ def main() -> None:
     logger.info("=" * 50)
 
     # 初始化 API 客户端
-    try:
-        client = lark.Client.builder() \
-            .app_id(APP_ID) \
-            .app_secret(APP_SECRET) \
-            .build()
-        logger.info("飞书 API 客户端初始化完成")
-    except Exception:
-        logger.critical("飞书 API 客户端初始化失败:\n%s", traceback.format_exc())
-        sys.exit(1)
-
+    _client = get_feishu_client()
     # 预热 AI 模型（可选 — 让第一次解析更快）
     try:
         get_agent()

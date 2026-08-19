@@ -1,0 +1,41 @@
+# 飞书记账机器人 systemd 服务单元
+# 安装位置：/etc/systemd/system/feishu-account-assistant.service
+# 通常无需手动修改本文件，直接运行仓库根目录的 deploy.sh 即可完成安装。
+#
+# 敏感配置（SILICON_API_KEY / APP_ID / APP_SECRET / APP_TOKEN / TABLE_ID / LOG_LEVEL）
+# 存放在 /opt/feishu-account-assistant/.env 中，由 EnvironmentFile 注入，
+# 请勿把凭证写进本单元文件。
+
+[Unit]
+Description=飞书记账机器人 (Feishu Account Assistant)
+Documentation=https://github.com/152360/FeiShuAccountAssistant
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 专用运行用户（deploy.sh 自动创建）
+User=feishubot
+Group=feishubot
+WorkingDirectory=/opt/feishu-account-assistant
+# 敏感配置从 .env 注入，仅本用户可读
+EnvironmentFile=/opt/feishu-account-assistant/.env
+ExecStart=/opt/feishu-account-assistant/venv/bin/python /opt/feishu-account-assistant/main.py
+
+# 进程异常退出时自动重启
+Restart=on-failure
+RestartSec=10
+
+# 优雅关闭：给足时间让线程池内的记账任务跑完
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+# 文件描述符上限（长连接场景下适当调大）
+LimitNOFILE=65535
+
+# 基础安全加固
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

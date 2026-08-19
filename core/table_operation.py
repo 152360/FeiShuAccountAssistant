@@ -7,7 +7,7 @@
 from lark_oapi import Client
 from lark_oapi.api.bitable.v1 import CreateAppTableRecordRequest, AppTableRecord
 
-from glob_config import (
+from config.glob_config import (
     APP_TOKEN,
     TABLE_ID,
     DEFAULT_CATEGORY,
@@ -15,7 +15,7 @@ from glob_config import (
     API_MAX_RETRIES,
     API_BASE_DELAY,
 )
-from logger_config import get_logger
+from config.logger_config import get_logger
 from utils import retry_with_backoff
 
 logger = get_logger(__name__)
