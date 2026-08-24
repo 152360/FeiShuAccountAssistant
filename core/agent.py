@@ -4,12 +4,11 @@ AI 模型模块
 - agent 通过工具调用完成记账 / 查账，输出自由文本
 - AI 失败时自动降级到正则记账
 """
-
 from typing import Any
 
 from langchain.agents import create_agent
 from langchain.chat_models import init_chat_model
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage
 
 from config.glob_config import (
     SILICON_API_KEY,
@@ -19,6 +18,8 @@ from config.glob_config import (
     BASE_URL,
 )
 from config.logger_config import get_logger
+from core.context_compressor import HistoryCompressor
+from core.context_manager import ContextManager
 from core.tools import (
     get_past_datetime,
     get_account_records,
@@ -40,12 +41,13 @@ if not _api_key:
 
 _model = None
 _agent = None
+_compressor = None   # 上下文压缩器（run_agent 中显式编排，_ensure_model 中初始化）
 _tools = [get_past_datetime, get_account_records, add_account_record]
 
 
 def _ensure_model():
     """延迟初始化模型（避免导入时就报错）"""
-    global _model, _agent
+    global _model, _agent, _compressor
     if _agent is not None:
         return
     if not _api_key:
@@ -60,6 +62,8 @@ def _ensure_model():
             api_key=_api_key,
             temperature=0.7,
         )
+        # 自定义上下文管理：摘要压缩器 + SQLite 存储
+        _compressor = HistoryCompressor(ContextManager())
         _agent = create_agent(
             model=_model,
             system_prompt=SYSTEM_PROMPT,
@@ -90,18 +94,26 @@ def run_agent(agent, message: str) -> dict[str, Any]:
         {"success": bool, "reply": str, "error_msg": str}
     """
     try:
-        res = agent.invoke({"messages": [{"role": "user", "content": message}]})
-        logger.debug("AI 原始返回: %s", safe_str(res))
+        # 加载历史摘要并注入输入（系统提示由 agent 内部处理，这里只加摘要和用户消息）
+        summaries = _compressor.load_summaries()
+        input_messages = summaries + [HumanMessage(content=message)]
+        res = agent.invoke({"messages": input_messages})
+        logger.info("AI 原始返回: %s", safe_str(res))
 
+        # 提取最终回复
         final_answer = _extract_final_answer(res)
         if final_answer:
             logger.info("AI 回复: %s", final_answer)
+            # 正常情况：用整轮消息更新摘要存储
+            _compressor.compress_and_store(res["messages"])
             return {
                 "success": True,
                 "error_msg": "",
                 "reply": final_answer,
             }
 
+        # AI 未给出有效回复：仍尝试更新上下文（本轮通常不会触发压缩）
+        _compressor.compress_and_store(res.get("messages", []))
         logger.error("AI 未返回有效回复: %s", safe_str(res))
         return {
             "success": False,
